@@ -1,0 +1,171 @@
+name: "越狱应用构建工作流"
+
+on:
+  schedule:
+    - cron: '0 */2 * * *' # 每2小时自动构建
+  workflow_dispatch: # 支持手动触发
+  push:
+    branches: [main, master] # 主分支推送时触发
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    # 修复：设置默认shell为bash
+    defaults:
+      run:
+        shell: bash
+        
+    # 修复：添加必要的环境变量
+    env:
+      GITHUB_WORKSPACE: /Users/runner/work/${{ https://github.com/yaoshuaya/Yuedu }} # 明确设置工作空间路径
+      HOME: /Users/runner # 设置HOME目录
+      APP_NAME: "Yuedu" # 应用名称
+      IOS_SDK: "iPhoneOS16.5" # iOS SDK版本
+      BUILD_SCHEME: "rootless" # 构建方案(rootless/rootful)
+      OUTPUT_DIR: "BuildOutput" # 构建输出目录
+
+    steps:
+      # 步骤1: 彻底解决Git权限问题
+      - name: 初始化Git配置
+        run: |
+          # 设置全局Git配置
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global --add safe.directory '*'
+          git config --global protocol.file.allow always
+          
+          # 修复工作空间所有权
+          sudo chown -R runner $GITHUB_WORKSPACE
+          sudo chmod -R u+w $GITHUB_WORKSPACE
+
+      # 步骤2: 安全检出代码（避免使用子模块）
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.GITHUB_WORKSPACE }}
+          fetch-depth: 0
+          # 修复：禁用子模块以避免权限问题
+          submodules: false
+
+      # 步骤3: 安装基础工具链
+      - name: 安装Procursus工具
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils gsed coreutils make git
+
+      # 步骤4: 安装THEOS框架（不使用Git）
+      - name: 安装THEOS
+        run: |
+          set -x
+          THEOS_DIR="${{ env.GITHUB_WORKSPACE }}/theos"
+          mkdir -p "$THEOS_DIR"
+          
+          # 修复：直接下载THEOS而不是使用Git克隆
+          curl -L https://github.com/theos/theos/archive/master.tar.gz | tar -xz -C "$THEOS_DIR" --strip-components=1
+          
+          echo "THEOS=$THEOS_DIR" >> $GITHUB_ENV
+          echo "PATH=$THEOS_DIR/bin:$PATH" >> $GITHUB_ENV
+
+      # 步骤5: 安装iOS SDK（避免Git操作）
+      - name: 安装iOS SDK
+        run: |
+          set -x
+          mkdir -p "$THEOS/sdks"
+          
+          SDK_URL="https://github.com/theos/sdks/releases/latest/download/${{ env.IOS_SDK }}.sdk.tar.xz"
+          
+          # 带重试的下载
+          curl -L --retry 3 --retry-delay 5 $SDK_URL --output "$THEOS/sdks/sdk.tar.xz"
+          
+          tar -xf "$THEOS/sdks/sdk.tar.xz" -C "$THEOS/sdks"
+          rm "$THEOS/sdks/sdk.tar.xz"
+          
+          # 标准化SDK目录名
+          if [ ! -d "$THEOS/sdks/${{ env.IOS_SDK }}.sdk" ]; then
+            mv "$THEOS/sdks/"*.sdk "$THEOS/sdks/${{ env.IOS_SDK }}.sdk"
+          fi
+
+      # 步骤6: 安装构建依赖
+      - name: 安装依赖
+        run: |
+          brew update
+          brew install libarchive pkg-config
+
+      # 步骤7: 设置构建信息（避免使用Git命令）
+      - name: 配置构建信息
+        run: |
+          BUILD_TIME=$(date -u +'%Y%m%d_%H%M%S')
+          
+          # 从文件中获取版本号，避免使用Git命令
+          if [ -f "VERSION" ]; then
+            APP_VERSION=$(cat VERSION)
+          elif [ -f "Makefile" ] && grep -q "PACKAGE_VERSION" Makefile; then
+            APP_VERSION=$(make print-PACKAGE_VERSION)
+          else
+            APP_VERSION="1.0.0-$BUILD_TIME" # 生成基于时间的版本号
+          fi
+          
+          echo "BUILD_TIME=$BUILD_TIME" >> $GITHUB_ENV
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "OUTPUT_PATH=${{ env.OUTPUT_DIR }}/${{ env.APP_NAME }}-v$APP_VERSION.tipa" >> $GITHUB_ENV
+
+      # 步骤8: 执行构建（避免Git操作）
+      - name: 构建应用
+        run: |
+          set -x
+          # 确保权限
+          sudo chown -R runner .
+          
+          # 构建命令
+          make clean || true
+          make package \
+            THEOS_PACKAGE_SCHEME=${{ env.BUILD_SCHEME }} \
+            ARCHS=arm64 \
+            TARGET=iphone:clang:latest:13.0 \
+            DEBUG=0 \
+            FINALPACKAGE=1 \
+            -j$(sysctl -n hw.physicalcpu)
+          
+          # 处理输出文件
+          mkdir -p "${{ env.OUTPUT_DIR }}"
+          
+          # 修复：使用find命令定位tipa文件
+          TIPA_FILE=$(find . -name "*.tipa" | head -1)
+          
+          if [ -f "$TIPA_FILE" ]; then
+            mv "$TIPA_FILE" "${{ env.OUTPUT_PATH }}"
+            echo "找到并移动了构建产物: $TIPA_FILE"
+          else
+            echo "##[error]未找到任何tipa文件!"
+            # 列出当前目录结构以帮助调试
+            ls -laR
+            exit 1
+          fi
+
+      # 步骤9: 上传构建产物
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-v${{ env.APP_VERSION }}
+          path: ${{ env.OUTPUT_PATH }}
+
+      # 步骤10: 创建Release
+      - name: 发布版本
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.OUTPUT_PATH }}
+          tag_name: ${{ github.ref }}
+          name: ${{ env.APP_NAME }} v${{ env.APP_VERSION }}
+          body: |
+            **成功构建版本**  
+            🚀 应用: ${{ env.APP_NAME }}  
+            📦 版本: ${{ env.APP_VERSION }}  
+            ⏰ 构建时间: ${{ env.BUILD_TIME }} (UTC)  
+            🔧 构建方案: ${{ env.BUILD_SCHEME }}  
+            [查看完整日志](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
