@@ -1,0 +1,188 @@
+name: "越狱应用构建工作流"
+
+on:
+  schedule:
+    - cron: '0 */2 * * *' # 每2小时自动构建
+  workflow_dispatch: # 支持手动触发
+  push:
+    branches: [main, master] # 主分支推送时触发
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest # 使用最新macOS版本
+    
+    env:
+      APP_NAME: "YourJailbreakApp" # 应用名称
+      REPO_URL: "https://github.com/your-username/your-repo.git" # 仓库地址
+      IOS_SDK: "iPhoneOS16.5" # iOS SDK版本
+      BUILD_SCHEME: "rootless" # 构建方案(rootless/rootful)
+      OUTPUT_DIR: "BuildOutput" # 构建输出目录
+
+    steps:
+      # 修复：使用官方checkout action代替git clone
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_URL }}
+          submodules: recursive
+          fetch-depth: 0
+          path: ${{ github.workspace }}
+
+      # 修复：添加Git配置避免权限问题
+      - name: 配置Git环境
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: 安装基础工具链
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils gsed coreutils make git
+
+      - name: 安装THEOS框架
+        run: |
+          set -x
+          export THEOS="${{ github.workspace }}/theos"
+          mkdir -p $THEOS
+          
+          # 使用更可靠的THEOS安装方法
+          git clone --depth 1 https://github.com/theos/theos.git $THEOS
+          
+          # 设置环境变量
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
+
+      - name: 安装iOS SDK
+        run: |
+          set -x
+          export THEOS="${{ github.workspace }}/theos"
+          mkdir -p $THEOS/sdks
+          
+          # 下载iOS SDK (添加重试逻辑)
+          SDK_URL="https://github.com/theos/sdks/releases/latest/download/${{ env.IOS_SDK }}.sdk.tar.xz"
+          for i in {1..3}; do
+            curl -L $SDK_URL --output $THEOS/sdks/sdk.tar.xz && break || sleep 10
+          done
+          
+          # 解压SDK
+          tar -xf $THEOS/sdks/sdk.tar.xz -C $THEOS/sdks
+          rm $THEOS/sdks/sdk.tar.xz
+          
+          # 标准化SDK目录名
+          if [ ! -d "$THEOS/sdks/${{ env.IOS_SDK }}.sdk" ]; then
+            mv $THEOS/sdks/*.sdk "$THEOS/sdks/${{ env.IOS_SDK }}.sdk"
+          fi
+
+      - name: 安装构建依赖
+        run: |
+          # 修复：添加brew更新避免安装失败
+          brew update-reset
+          brew install libarchive pkg-config
+          
+          # 安装Python依赖
+          if [ -f "requirements.txt" ]; then
+            pip3 install -r requirements.txt
+          fi
+
+      - name: 设置构建信息
+        run: |
+          set -x
+          BUILD_TIME=$(date -u +'%Y%m%d_%H%M%S')
+          GIT_HASH=$(git rev-parse --short HEAD)
+          
+          # 修复：更健壮的版本号获取
+          if [ -f "VERSION" ]; then
+            APP_VERSION=$(cat VERSION)
+          elif [ -f "Makefile" ] && grep -q "PACKAGE_VERSION" Makefile; then
+            APP_VERSION=$(make print-PACKAGE_VERSION)
+          else
+            APP_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "1.0.0")
+          fi
+          
+          echo "BUILD_TIME=${BUILD_TIME}" >> $GITHUB_ENV
+          echo "GIT_HASH=${GIT_HASH}" >> $GITHUB_ENV
+          echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
+          echo "OUTPUT_NAME=${{ env.APP_NAME }}-v${{ env.APP_VERSION }}.tipa" >> $GITHUB_ENV
+          echo "OUTPUT_PATH=${{ env.OUTPUT_DIR }}/${{ env.APP_NAME }}-v${{ env.APP_VERSION }}.tipa" >> $GITHUB_ENV
+
+      - name: 预处理
+        run: |
+          set -x
+          # 修复：更安全的plist处理
+          if [ -f "Application/Info.plist" ]; then
+            plutil -replace CFBundleVersion -string "${{ env.BUILD_TIME }}" Application/Info.plist
+            plutil -replace CFBundleShortVersionString -string "${{ env.APP_VERSION }}" Application/Info.plist
+          fi
+          
+          # 修复：更健壮的Credits.plist修改
+          CREDITS_FILE="Application/UI/Settings/Credits.plist"
+          if [ -f "$CREDITS_FILE" ]; then
+            # 使用更可靠的查找方法
+            DOCreditsCellIndex=$(plutil -extract items raw -expect array "$CREDITS_FILE" | \
+              grep -n "DOCreditsCell" | cut -d: -f1 | head -n1)
+            
+            if [ -n "$DOCreditsCellIndex" ]; then
+              # 数组索引从0开始，行号减1
+              index=$((DOCreditsCellIndex - 1))
+              plutil -insert items.$index.names -xml \
+                "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" \
+                -append "$CREDITS_FILE"
+            else
+              echo "未找到DOCreditsCell，跳过修改"
+            fi
+          fi
+
+      - name: 执行构建
+        run: |
+          set -x
+          export THEOS="${{ github.workspace }}/theos"
+          
+          # 修复：添加错误处理
+          make clean || true
+          
+          # 使用更可靠的构建命令
+          make package \
+            THEOS_PACKAGE_SCHEME=${{ env.BUILD_SCHEME }} \
+            ARCHS=arm64 \
+            TARGET=iphone:clang:latest:13.0 \
+            DEBUG=0 \
+            FINALPACKAGE=1 \
+            -j$(sysctl -n hw.physicalcpu)
+          
+          # 确保输出目录存在
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          
+          # 修复：更灵活的输出文件处理
+          if [ -f "packages/*.tipa" ]; then
+            mv packages/*.tipa "${{ env.OUTPUT_PATH }}"
+          elif [ -f "Application/${{ env.APP_NAME }}.tipa" ]; then
+            mv "Application/${{ env.APP_NAME }}.tipa" "${{ env.OUTPUT_PATH }}"
+          else
+            echo "##[error]未找到构建产物!"
+            exit 1
+          fi
+
+      - name: 安装trustcache工具
+        run: |
+          set -x
+          # 修复：添加错误处理
+          git clone https://github.com/CRKatri/trustcache || true
+          cd trustcache
+          make -j$(sysctl -n hw.physicalcpu) OPENSSL=1
+          sudo cp trustcache /usr/local/bin/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-v${{ env.APP_VERSION }}
+          path: ${{ env.OUTPUT_PATH }}
+
+      - name: 创建版本发布
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v1
+        with
