@@ -17,7 +17,7 @@ jobs:
     
     env:
       APP_NAME: "Yoedu"  # 修改为你的应用名称
-      THEOS_VERSION: "v2.6"         # THEOS 版本
+      THEOS_VERSION: "v99.99"         # THEOS 版本
       IOS_SDK: "iPhoneOS16.3"       # iOS SDK 版本
       OUTPUT_DIR: "Build"           # 构建输出目录
 
