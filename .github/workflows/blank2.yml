@@ -17,7 +17,7 @@ jobs:
     
     env:
       APP_NAME: "YourJailbreakApp" # 应用名称
-      REPO_URL: "https://github.com/your-username/your-repo.git" # 仓库地址
+      REPO_URL: "https://github.com/yaoshuaya/Yuedu" # 仓库地址
       IOS_SDK: "iPhoneOS16.5" # iOS SDK版本
       BUILD_SCHEME: "rootless" # 构建方案(rootless/rootful)
       OUTPUT_DIR: "BuildOutput" # 构建输出目录
